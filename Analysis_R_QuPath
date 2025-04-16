@@ -1,0 +1,410 @@
+###############################
+### 1. Load Required Libraries
+###############################
+
+# Uncomment installation lines if packages are not installed
+# install.packages(c("dplyr", "RColorBrewer", "readr", "openxlsx", "factoextra", "stringr", "readxl", "ggplot2"))
+# BiocManager::install(c("org.Hs.eg.db", "DESeq2", "apeglm", "pheatmap", "vsn"))
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(pheatmap)
+library(vsn)
+library(RColorBrewer)
+library(openxlsx)
+library(readxl)
+library(factoextra)
+library(org.Hs.eg.db)
+library(DESeq2)
+
+###############################
+### 2. Set Working Directory
+###############################
+
+setwd("C:\\Users\\hp\\Desktop\\QuPath\\Analysis_R_QuPath")
+
+###############################
+### 3. Load and Clean Datasets
+###############################
+
+file_names <- list.files(pattern = "Exported_Data_.*_Normalized.csv")
+
+load_and_clean <- function(file) {
+  df <- read_delim(file, delim = ";", show_col_types = FALSE)
+  MO <- str_extract(file, "MO\\d+")
+  
+  age <- case_when(
+    MO %in% c("MO25", "MO26", "MO27", "MO28") ~ "WT",
+    MO %in% c("MO18", "MO29", "MO30") ~ "2m",
+    MO %in% c("MO20", "MO31", "MO32") ~ "4m",
+    MO %in% c("MO33", "MO34", "MO35") ~ "6m",
+    TRUE ~ "Unknown"
+  )
+  
+  df$Mouse <- MO
+  df$Age <- age
+  return(df)
+}
+
+all_data <- lapply(file_names, load_and_clean) %>% bind_rows()
+
+###############################
+### 4. Subset Microglia & Plaques
+###############################
+
+microglia <- all_data %>% filter(Classification == "Iba1")
+plaques   <- all_data %>% filter(Classification == "Amylo-Glow")
+
+###############################
+### 5. Metrics and Summaries
+###############################
+
+## 5a: Count per group
+counts <- all_data %>%
+  group_by(Mouse, Age, Classification) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+## 5b: Mean nucleus area (Microglia only)
+microglia$`Nucleus: Area` <- as.numeric(microglia$`Nucleus: Area`)
+
+mean_nucleus_microglia <- microglia %>%
+  group_by(Mouse, Age) %>%
+  summarise(Mean_Nucleus_Area = mean(`Nucleus: Area`, na.rm = TRUE), .groups = 'drop')
+
+## 5c: Mean normalized cell area for all classes
+all_data$`Cell Area per mm² tissue` <- as.numeric(as.character(all_data$`Cell Area per mm² tissue`))
+
+mean_cell_area <- all_data %>%
+  filter(!is.na(`Cell Area per mm² tissue`)) %>%
+  group_by(Mouse, Age, Classification) %>%
+  summarise(Mean_Cell_Area_mm2 = mean(`Cell Area per mm² tissue`, na.rm = TRUE), .groups = 'drop')
+
+## 5d: Microglia per mm²
+microglia <- microglia %>%
+  mutate(
+    `Cell: Area` = as.numeric(`Cell: Area`),
+    `Total Tissue Area (µm²)` = as.numeric(`Total Tissue Area (µm²)`)
+  )
+
+per_mouse_microglia <- microglia %>%
+  group_by(Mouse, Age) %>%
+  summarise(
+    Cell_Count = n(),
+    Total_Cell_Area = sum(`Cell: Area`, na.rm = TRUE),
+    Tissue_Area_mm2 = sum(`Total Tissue Area (µm²)`, na.rm = TRUE) / 1e6,
+    Cell_Density = Cell_Count / Tissue_Area_mm2,
+    Cell_Area_Density = Total_Cell_Area / Tissue_Area_mm2,
+    .groups = 'drop'
+  )
+
+## 5e: Plaques per mm²
+plaques <- plaques %>%
+  mutate(
+    `Cell: Area` = as.numeric(`Cell: Area`),
+    `Total Tissue Area (µm²)` = as.numeric(`Total Tissue Area (µm²)`)
+  )
+
+per_mouse_plaques <- plaques %>%
+  group_by(Mouse, Age) %>%
+  summarise(
+    Plaque_Count = n(),
+    Total_Plaque_Area = sum(`Cell: Area`, na.rm = TRUE),
+    Tissue_Area_mm2 = sum(`Total Tissue Area (µm²)`, na.rm = TRUE) / 1e6,
+    Plaque_Density = Plaque_Count / Tissue_Area_mm2,
+    Plaque_Area_Density = Total_Plaque_Area / Tissue_Area_mm2,
+    .groups = 'drop'
+  )
+
+###############################
+### 6. Save Normalized Data (for plots)
+###############################
+
+write.csv(per_mouse_microglia, "Microglia_Density_Area_Normalized.csv", row.names = FALSE)
+write.csv(per_mouse_plaques, "Plaques_Density_Area_Normalized.csv", row.names = FALSE)
+
+#############################################################################
+########### Libraries #######################################################
+#############################################################################
+
+library(ggplot2)
+library(ggsignif)
+library(gridExtra)
+library(car)
+
+#############################################################################
+########### Reorder Age Levels #############################################
+#############################################################################
+
+per_mouse_microglia$Age <- factor(per_mouse_microglia$Age, levels = c("WT", "2m", "4m", "6m"))
+per_mouse_plaques$Age <- factor(per_mouse_plaques$Age, levels = c("WT", "2m", "4m", "6m"))
+
+# Add missing WT and 2m to plaques
+missing_levels <- c("WT", "2m")
+for (level in missing_levels) {
+  if (!(level %in% unique(per_mouse_plaques$Age))) {
+    per_mouse_plaques <- rbind(per_mouse_plaques, data.frame(
+      Mouse = NA,
+      Age = level,
+      Plaque_Count = NA,
+      Total_Plaque_Area = NA,
+      Tissue_Area_mm2 = NA,
+      Plaque_Density = NA,
+      Plaque_Area_Density = NA
+    ))
+  }
+}
+
+#############################################################################
+########### Statistical Analysis - Microglia ###############################
+#############################################################################
+
+leveneTest(Cell_Density ~ Age, data = per_mouse_microglia)
+
+anova_cell_density <- aov(Cell_Density ~ Age, data = per_mouse_microglia)
+anova_cell_area_density <- aov(Cell_Area_Density ~ Age, data = per_mouse_microglia)
+
+tukey_cell_density <- TukeyHSD(anova_cell_density)
+tukey_cell_area_density <- TukeyHSD(anova_cell_area_density)
+
+tukey_cell_density_results <- as.data.frame(tukey_cell_density$`Age`)
+tukey_cell_area_density_results <- as.data.frame(tukey_cell_area_density$`Age`)
+
+cat("ANOVA Microglia Density:\n"); print(summary(anova_cell_density))
+cat("Tukey Microglia Density:\n"); print(tukey_cell_density)
+cat("ANOVA Microglia Area Density:\n"); print(summary(anova_cell_area_density))
+cat("Tukey Microglia Area Density:\n"); print(tukey_cell_area_density)
+
+# Define comparisons including WT
+comparisons_list <- list(
+  c("WT", "2m"), c("WT", "4m"), c("WT", "6m"),
+  c("2m", "4m"), c("2m", "6m"), c("4m", "6m")
+)
+
+# Helper to convert p to *
+get_significance <- function(p_value) {
+  if (p_value < 0.001) return("***")
+  else if (p_value < 0.01) return("**")
+  else if (p_value < 0.05) return("*")
+  else return("")
+}
+
+# Extract p-values in matching order
+extract_tukey_stars <- function(tukey_df, comparison_list) {
+  sapply(comparison_list, function(comp) {
+    name1 <- paste(comp[2], comp[1], sep = "-")  # Tukey outputs reverse order!
+    name2 <- paste(comp[1], comp[2], sep = "-")
+    if (name1 %in% rownames(tukey_df)) {
+      get_significance(tukey_df[name1, "p adj"])
+    } else if (name2 %in% rownames(tukey_df)) {
+      get_significance(tukey_df[name2, "p adj"])
+    } else {
+      ""
+    }
+  })
+}
+
+#############################################################################
+########### Statistical Analysis - Plaques #################################
+#############################################################################
+
+anova_plaque_density <- aov(Plaque_Density ~ Age, data = per_mouse_plaques)
+anova_plaque_area_density <- aov(Plaque_Area_Density ~ Age, data = per_mouse_plaques)
+
+tukey_plaque_density <- TukeyHSD(anova_plaque_density)
+tukey_plaque_area_density <- TukeyHSD(anova_plaque_area_density)
+
+cat("ANOVA Plaque Density:\n"); print(summary(anova_plaque_density))
+cat("Tukey Plaque Density:\n"); print(tukey_plaque_density)
+cat("ANOVA Plaque Area Density:\n"); print(summary(anova_plaque_area_density))
+cat("Tukey Plaque Area Density:\n"); print(tukey_plaque_area_density)
+
+# --- PLOT SECTION with Tukey annotations (including WT) ---
+
+# Reorder Age factor
+per_mouse_microglia$Age <- factor(per_mouse_microglia$Age, levels = c("WT", "2m", "4m", "6m"))
+per_mouse_plaques$Age <- factor(per_mouse_plaques$Age, levels = c("WT", "2m", "4m", "6m"))
+
+# Define comparisons list
+comparisons_list <- list(
+  c("4m", "WT"),   # Significant comparison (Microglia Density & Area Density)
+  c("6m", "WT"),   # Significant comparison (Microglia Density & Area Density)
+  c("6m", "4m")    # Significant comparison (Plaque Area Density)
+)
+
+
+# Function to convert p-values to significance asterisks
+get_significance <- function(p_value) {
+  if (p_value < 0.001) {
+    return("***")
+  } else if (p_value < 0.01) {
+    return("**")
+  } else if (p_value < 0.05) {
+    return("*")
+  } else {
+    return("")
+  }
+}
+
+# Extract p-values and apply significance conversion
+tukey_cell_density_results <- as.data.frame(tukey_cell_density$`Age`)
+tukey_cell_area_density_results <- as.data.frame(tukey_cell_area_density$`Age`)
+tukey_plaque_density_results <- as.data.frame(tukey_plaque_density$`Age`)
+tukey_plaque_area_density_results <- as.data.frame(tukey_plaque_area_density$`Age`)
+
+annotations_density <- sapply(tukey_cell_density_results$`p adj`, get_significance)
+annotations_area_density <- sapply(tukey_cell_area_density_results$`p adj`, get_significance)
+annotations_plaque_density <- sapply(tukey_plaque_density_results$`p adj`, get_significance)
+annotations_plaque_area_density <- sapply(tukey_plaque_area_density_results$`p adj`, get_significance)
+
+# Define color palette
+color_palette <- c("WT" = "#A7C7E7", "2m" = "pink", "4m" = "lightgreen", "6m" = "#D1B2FF")
+
+# Plot: Microglia Density
+plot_microglia_density <- ggplot(per_mouse_microglia, aes(x = Age, y = Cell_Density)) +
+  stat_summary(fun = "mean", geom = "bar", aes(fill = Age, color = Age), width = 0.6) +
+  geom_jitter(color = "black", size = 2.5, width = 0.2, alpha = 0.6) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, color = "black") +
+  geom_signif(comparisons = comparisons_list,
+              annotations = sapply(tukey_cell_density_results$'p adj'[c(2, 3, 4)], get_significance), 
+              map_signif_level = FALSE, 
+              y_position = c(6, 7)) +  # Adjust the positions for the asterisks if needed
+  labs(x = "Age", y = "Microglia / mm²", title = "Microglia Density") +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+
+# Plot: Microglia Area Density
+plot_microglia_area_density <- ggplot(per_mouse_microglia, aes(x = Age, y = Cell_Area_Density)) +
+  stat_summary(fun = "mean", geom = "bar", aes(fill = Age, color = Age), width = 0.6) +
+  geom_jitter(color = "black", size = 2.5, width = 0.2, alpha = 0.6) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, color = "black") +
+  geom_signif(comparisons = comparisons_list,
+              annotations = sapply(tukey_cell_area_density_results$'p adj'[c(2, 3, 4)], get_significance), 
+              map_signif_level = FALSE,
+              y_position = c(5000, 6000)) +  # You can adjust these based on your data
+  labs(x = "Age", y = "Microglia Area Density (µm²/mm²)", title = "Microglia Area Density") +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+# Plot: Plaque Density
+p_val <- tukey_plaque_density_results$`p adj`[1]
+
+plot_plaque_density <- ggplot(per_mouse_plaques, aes(x = Age, y = Plaque_Density)) +
+  stat_summary(fun = "mean", geom = "bar", aes(fill = Age, color = Age), width = 0.6) +
+  geom_jitter(color = "black", size = 2.5, width = 0.2, alpha = 0.6) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, color = "black") +
+  labs(x = "Age", y = "Plaques / mm²", title = "Plaque Density") +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+if (!is.na(p_val) && p_val < 0.05) {
+  plot_plaque_density <- plot_plaque_density +
+    geom_signif(comparisons = list(c("4m", "6m")),
+                annotations = get_significance(p_val),
+                map_signif_level = FALSE,
+                y_position = 15)
+}
+
+plot_plaque_density
+
+
+# Plot: Plaque Area Density
+plot_plaque_area_density <- ggplot(per_mouse_plaques, aes(x = Age, y = Plaque_Area_Density)) +
+  stat_summary(fun = "mean", geom = "bar", aes(fill = Age, color = Age), width = 0.6) +
+  geom_jitter(color = "black", size = 2.5, width = 0.2, alpha = 0.6) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, color = "black") +
+  geom_signif(comparisons = list(c("4m", "6m")),
+              annotations = get_significance(tukey_plaque_area_density_results$`p adj`[1]),
+              map_signif_level = FALSE,
+              y_position = 2600) +
+  labs(x = "Age", y = "Plaque Area Density (µm²/mm²)", title = "Plaque Area Density") +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+
+######################################
+####### SAVE PLOTS ###################
+######################################
+
+library(patchwork)
+
+#microglia plot
+plot_microglia <- plot_microglia_density + plot_microglia_area_density +
+  plot_layout(ncol = 2) + 
+  plot_annotation(title = "Microglia Analysis")
+
+ggsave("microglia_combined.png", plot = plot_microglia, width = 12, height = 5, dpi = 300)
+
+# plaques plot
+plot_plaques <- plot_plaque_density + plot_plaque_area_density +
+  plot_layout(ncol = 2) +
+  plot_annotation(title = "Plaque Analysis")
+
+ggsave("plaques_combined.png", plot = plot_plaques, width = 12, height = 5, dpi = 300)
+
+
+#####################################
+####### TABLE 
+#####################################
+plaques <- read_csv("Plaques_Density_Area_Normalized.csv")
+microglia <- read_csv("Microglia_Density_Area_Normalized.csv")
+
+# Helper function to calculate mean ± SEM
+summary_stats <- function(data, variable) {
+  data %>%
+    group_by(Age) %>%
+    summarise(
+      Mean = mean(.data[[variable]], na.rm = TRUE),
+      SEM = sd(.data[[variable]], na.rm = TRUE) / sqrt(n())
+    ) %>%
+    mutate(Formatted = sprintf("%.2f ± %.2f", Mean, SEM)) %>%
+    select(Age, Formatted)
+}
+
+# Summarize each variable
+plaque_density <- summary_stats(plaques, "Plaque_Density")
+plaque_area <- summary_stats(plaques, "Plaque_Area_Density")
+microglia_density <- summary_stats(microglia, "Cell_Density")
+microglia_area <- summary_stats(microglia, "Cell_Area_Density")
+
+# Combine all summaries
+table_data <- plaque_density %>%
+  full_join(plaque_area, by = "Age") %>%
+  full_join(microglia_density, by = "Age") %>%
+  full_join(microglia_area, by = "Age") %>%
+  arrange(match(Age, c("WT", "2m", "4m", "6m")))
+
+# Generate GT table
+gt_table <- table_data %>%
+  gt() %>%
+  tab_header(
+    title = "Summary of Amylo-Glo Plaque and Iba1⁺ Microglia Quantification"
+  ) %>%
+  cols_label(
+    Age = "Age",
+    `Plaque Density` = "Plaque Density (mean ± SEM)",
+    `Plaque Area Density` = "Plaque Area Density (mean ± SEM)",
+    `Microglia Density` = "Microglia Density (mean ± SEM)",
+    `Microglia Area Density` = "Microglia Area Density (mean ± SEM)"
+  ) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14
+  )
+
+# Save as PNG
+gtsave(gt_table, filename = "Summary_Table.png")
+#Save as PDF (optional)
+gtsave(gt_table, filename = "Summary_Table.pdf")
+
+
