@@ -1,0 +1,84 @@
+import qupath.lib.gui.scripting.QPEx 
+import qupath.lib.objects.PathObject
+import java.nio.file.Paths
+import java.nio.file.Files
+import java.nio.charset.StandardCharsets
+
+def currentProject = QPEx.getProject()
+if (currentProject == null) {
+    print("❌ No project loaded!")
+    return
+}
+
+def outputFile = Paths.get("C:\\Users\\hp\\Desktop\\QuPath\\mouse_code\\Exported_Data_mousecode_Normalized.csv")
+def imageEntries = currentProject.getImageList()
+if (imageEntries.isEmpty()) {
+    print("❌ No images found in the project!")
+    return
+}
+
+def headers = [
+    "Image", "Object ID", "Classification", "Centroid X µm", "Centroid Y µm",
+    "Nucleus: Area", "Nucleus: Perimeter", "Nucleus: Circularity",
+    "Cell: Area", "Cell: Perimeter", "Cell: Circularity",
+    "Detection Area (µm²)", "Total Tissue Area (µm²)", "Cell Area per mm² tissue"
+]
+
+def dataRows = []
+dataRows << headers.join(";")
+
+for (imgEntry in imageEntries) {
+    def imgData = imgEntry.readImageData()
+    if (imgData == null) continue
+    def imgHierarchy = imgData.getHierarchy()
+    def imageName = imgEntry.getImageName()
+    def pathObjects = imgHierarchy.getFlattenedObjectList(null)
+
+    // Get total area of all detected cells as proxy for tissue area
+    def totalCellArea = 0.0
+    for (obj in pathObjects) {
+        def area = obj.getMeasurementList().getMeasurementValue("Cell: Area")
+        if (!Double.isNaN(area)) {
+            totalCellArea += area
+        }
+    }
+
+    // Now export per-object data, normalized
+    for (obj in pathObjects) {
+        def classification = obj.getPathClass() ? obj.getPathClass().toString() : "Unclassified"
+        def centroidX = obj.getROI()?.getCentroidX()
+        def centroidY = obj.getROI()?.getCentroidY()
+        def objId = obj.getID()
+
+        def nucleusArea = obj.getMeasurementList().getMeasurementValue("Nucleus: Area") ?: "N/A"
+        def nucleusPerimeter = obj.getMeasurementList().getMeasurementValue("Nucleus: Perimeter") ?: "N/A"
+        def nucleusCircularity = obj.getMeasurementList().getMeasurementValue("Nucleus: Circularity") ?: "N/A"
+        def cellArea = obj.getMeasurementList().getMeasurementValue("Cell: Area") ?: "N/A"
+        def cellPerimeter = obj.getMeasurementList().getMeasurementValue("Cell: Perimeter") ?: "N/A"
+        def cellCircularity = obj.getMeasurementList().getMeasurementValue("Cell: Circularity") ?: "N/A"
+
+        def normalizedCellArea = (cellArea != "N/A" && totalCellArea > 0) ? (cellArea / totalCellArea) * 1_000_000 : "N/A" // per mm²
+
+        def values = [
+            imageName,
+            objId,
+            classification,
+            centroidX != null ? centroidX : "N/A",
+            centroidY != null ? centroidY : "N/A",
+            nucleusArea,
+            nucleusPerimeter,
+            nucleusCircularity,
+            cellArea,
+            cellPerimeter,
+            cellCircularity,
+            cellArea,
+            totalCellArea,
+            normalizedCellArea
+        ]
+
+        dataRows << values.join(";")
+    }
+}
+
+Files.write(outputFile, dataRows, StandardCharsets.UTF_8)
+print "✅ Normalized data exported successfully to: " + outputFile
